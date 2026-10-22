@@ -1,0 +1,83 @@
+
+from app.services.csv_ingestion import artifact_path
+from app.services.csv_parser import MAX_BYTES
+
+
+def upload(env, data, delimiter=",", filename="public-data.csv"):
+    return env.client.post("/api/v1/datasets/upload", headers={"X-Trace-Client":"web"},
+        files={"file":(filename,data,"text/csv")},data={"delimiter":delimiter})
+
+
+def test_upload_profile_and_original_bytes_preserved_and_bad_records_block_reports(env):
+    data=b"amount,date,group\n1,2026-10-20,A\n2,2026-10-21,B\n3,missing-field\n"
+    response=upload(env,data)
+    assert response.status_code==200
+    item=response.json()
+    profile=env.client.get(f"/api/v1/datasets/{item['id']}/profile").json()
+    assert profile["total_records"]==3 and profile["readable_rows"]==2 and profile["unreadable_rows"]==1
+    assert profile["analysis_ready"] is False
+    assert env.client.get(f"/api/v1/datasets/{item['id']}/raw").content==data
+    report=env.client.post("/api/v1/reports",headers={"X-Trace-Client":"web"},json={"dataset_id":item["id"],"title":"Blocked"})
+    assert report.status_code==422
+    assert "unreadable" in report.json()["detail"]
+
+
+def test_all_csv_endpoints_enforce_owner_and_anonymous_access(env):
+    item=upload(env,b"a,b\n1,2\n").json()
+    env.state.current=env.second
+    for suffix in ["profile","preview","errors","raw"]:
+        assert env.client.get(f"/api/v1/datasets/{item['id']}/{suffix}").status_code==404
+    del env.app.dependency_overrides[get_current_user]
+    assert upload(env,b"a,b\n1,2\n").status_code==401
+
+
+def test_all_errors_are_pageable_not_dropped_after_first_page(env):
+    item=upload(env,b"a,b\n"+b"only-one-field\n"*61).json()
+    first=env.client.get(f"/api/v1/datasets/{item['id']}/errors?limit=50").json()
+    second=env.client.get(f"/api/v1/datasets/{item['id']}/errors?offset=50&limit=50").json()
+    assert first["total"]==second["total"]==61
+    assert len(first["items"])==50 and len(second["items"])==11
+    assert [x["record_number"] for x in first["items"]+second["items"]]==list(range(1,62))
+
+
+def test_legacy_public_sample_is_profiled_and_ready_without_a_migration(env):
+    item=env.client.post("/api/v1/datasets/sample",headers={"X-Trace-Client":"web"}).json()
+    profile=env.client.get(f"/api/v1/datasets/{item['id']}/profile")
+    assert profile.status_code==200
+    assert profile.json()["readable_rows"]==244
+    assert profile.json()["error_count"]==0
+    assert profile.json()["columns"][0]["type"]=="number"
+
+
+def test_rejected_files_leave_no_dataset_or_files(env):
+    for data in [b"",b"\xff",b"a,a\n1,2\n",b"x"*(MAX_BYTES+1)]:
+        assert upload(env,data).status_code in {400,413}
+    with env.db() as db:
+        assert db.scalar(select(Dataset)) is None
+    assert list(env.storage.iterdir())==[]
+
+
+def test_semicolon_config_survives_cache_rebuild_and_cannot_be_silently_changed(env):
+    data=b"name;amount\nA;12\n"
+    item=upload(env,data,";").json()
+    assert upload(env,data,";").json()["id"]==item["id"]
+    assert upload(env,data,",").status_code==409
+    with env.db() as db:
+        dataset=db.get(Dataset,uuid.UUID(item["id"]))
+        artifact_path(dataset,"rows.jsonl").unlink()
+    rebuilt=env.client.get(f"/api/v1/datasets/{item['id']}/profile").json()
+    assert rebuilt["delimiter"]==";" and len(rebuilt["columns"])==2
+
+
+def test_delete_removes_source_and_all_sidecars(env):
+    item=upload(env,b"a,b\n1,2\n").json()
+    assert len(list(env.storage.iterdir()))==4
+    result=env.client.delete(f"/api/v1/datasets/{item['id']}",headers={"X-Trace-Client":"web"})
+    assert result.status_code==204
+    assert list(env.storage.iterdir())==[]
+
+
+def test_upload_write_protection_and_preview_limit(env):
+    assert env.client.post("/api/v1/datasets/upload",files={"file":("data.csv",b"a\n1\n","text/csv")}).status_code==403
+    item=upload(env,b"a\n1\n").json()
+    assert env.client.get(f"/api/v1/datasets/{item['id']}/preview?limit=101").status_code==422

@@ -1,0 +1,20 @@
+
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Private datasets
+storage/
+
+# Frontend
+node_modules/
+dist/
+
+client_secret_*.json

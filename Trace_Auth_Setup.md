@@ -1,0 +1,389 @@
+# Trace — email verification, password reset, and login rate limiting
+
+Prepared 21 October 2026. This extends the FastAPI/PostgreSQL backend from our conversation. Google and GitHub sign-in are both user-confirmed working.
+
+The ZIP contains complete source files under their destination paths, plus integration tests. It is an overlay for your existing repository, not a replacement project. Your current database configuration, session helpers, Google/GitHub provider configuration, OAuth callback routes, and main application are retained.
+
+## 1. What this adds
+
+| Feature | Behavior |
+| --- | --- |
+| Email verification | Email/password registration creates an unverified account and sends a 24-hour link. Login requires verification. |
+| Google/GitHub | Their already-validated provider emails verify new OAuth accounts. No automatic account merging. |
+| Password reset | A 30-minute single-use link changes an existing local password and revokes every app session. No automatic login. |
+| Provider-only accounts | Forgot-password returns the same generic response, but cannot create a local password. |
+| Login throttling | Independent email and IP counters in PostgreSQL; enforced across processes and restarts. |
+| Local email | Mailpit captures messages at localhost:8025; it does not send them to Gmail or other real inboxes. |
+| Confirmation pages | Minimal working pages served by the backend, so you can test before the React UI exists. |
+
+Raw action tokens are sent only in email links. PostgreSQL stores SHA-256 hashes. Verification and reset are separate purposes. Expiry and single-use redemption are enforced on the server.
+
+## 2. Install the source overlay
+
+Stop the running backend first.
+
+Download `Trace_Auth_Extension.zip`. Run these commands from your repository root on your Mac:
+
+```bash
+cd /Users/harshitatiwari/trace-report-builder
+
+TRACE_AUTH_BACKUP=$(mktemp -d)
+cp -R backend/app "$TRACE_AUTH_BACKUP/app"
+
+TRACE_AUTH_PACKAGE=$(mktemp -d)
+unzip -q "$HOME/Downloads/Trace_Auth_Extension.zip" -d "$TRACE_AUTH_PACKAGE"
+
+cp -R "$TRACE_AUTH_PACKAGE/backend/app/." backend/app/
+mkdir -p backend/scripts backend/tests
+cp "$TRACE_AUTH_PACKAGE/backend/scripts/cleanup_auth.py" backend/scripts/
+cp "$TRACE_AUTH_PACKAGE/backend/tests/test_auth_email_security.py" backend/tests/
+cp "$TRACE_AUTH_PACKAGE/infra/compose.auth-mail.yaml" infra/
+```
+
+The archive contains no credentials or .env replacement. Keep your current .env. The example file inside the ZIP is reference text only.
+
+Four existing files are replaced:
+
+- `backend/app/models/auth.py`
+- `backend/app/schemas/auth.py`
+- `backend/app/api/v1/routes/auth.py`
+- `backend/app/services/auth/oauth.py`
+
+New modules:
+
+- `backend/app/core/email_config.py`
+- `backend/app/services/auth/rate_limit.py`
+- `backend/app/services/auth/mailer.py`
+- `backend/app/services/auth/email_actions.py`
+- `backend/app/services/auth/pages.py`
+
+If you have modified those four existing files beyond the code we discussed, merge those changes before running. The backup location is in `$TRACE_AUTH_BACKUP`; keep that terminal variable until setup is finished.
+
+No new runtime Python package is required beyond the backend dependencies already used. Mail sending uses Python's standard library. Do not upgrade the working Authlib stack for this change.
+
+## 3. Start the local mail inbox
+
+The extra Compose file adds a Mailpit service without replacing your PostgreSQL service.
+
+From the repository root:
+
+```bash
+docker compose -f infra/compose.yaml -f infra/compose.auth-mail.yaml up -d postgres mailpit
+```
+
+Open:
+
+```text
+http://localhost:8025
+```
+
+The UI and SMTP ports bind to the local machine only. The image is pinned to a documented stable Mailpit tag.
+
+Append the following to `backend/.env`:
+
+```dotenv
+SMTP_HOST=127.0.0.1
+SMTP_PORT=1025
+SMTP_SECURITY=plain
+MAIL_FROM=noreply@example.com
+```
+
+Retain `BACKEND_URL=http://localhost:8000`, the database URL, the session secret, and your existing provider credentials. Do not paste example credentials over working values.
+
+This configuration assumes the backend still runs directly on your Mac. If later run inside the same Compose network, use `SMTP_HOST=mailpit`; localhost inside a container points to that container.
+
+Validate the mail settings without printing passwords:
+
+```bash
+cd backend
+uv run python -c "from app.core.email_config import get_email_settings; get_email_settings(); print('SMTP settings valid')"
+```
+
+For real email delivery later, configure an SMTP server you can use without paid services. Use `SMTP_SECURITY=starttls` or `ssl`, its port, both username/password when required, and an authorized sender address. Plain SMTP and credentials together are rejected. Mailpit is a test inbox, not an outbound mail provider.
+
+## 4. Generate and review the migration
+
+From `backend`:
+
+```bash
+uv run alembic revision --autogenerate -m "add email verification tokens and auth rate limits"
+```
+
+Keep the revision/down_revision values generated by your own repository. No fixed migration file is included because its parent revision must match your current database history.
+
+The generated `upgrade()` should:
+
+1. Add `users.email_verified` as a non-null Boolean with a false server default.
+2. Create `email_action_tokens`, including its user FK, purpose constraint, unique token hash, and expiry index.
+3. Create `auth_rate_limits`, including key primary key, positive hits constraint, and window_end index.
+
+At the END of the generated `upgrade()`, after the new column exists, add:
+
+```python
+    # Previous OAuth callbacks already required verified provider emails.
+    # Existing local password accounts must still verify explicitly.
+    op.execute("""
+        UPDATE users AS u
+        SET email_verified = true
+        WHERE u.password_hash IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM auth_identities AS a
+              WHERE a.user_id = u.id
+                AND a.provider IN ('google', 'github')
+          )
+    """)
+
+    # Do not preserve sessions that bypass the newly enforced verification.
+    op.execute("""
+        DELETE FROM sessions
+        WHERE user_id IN (
+            SELECT id FROM users WHERE email_verified = false
+        )
+    """)
+```
+
+Review that no unrelated tables are dropped. Then apply:
+
+```bash
+uv run alembic upgrade head
+uv run alembic current
+```
+
+Existing provider-only Google/GitHub users remain verified. Existing password accounts become unverified; use the resend endpoint below. Revoking their old sessions is intentional. A schema downgrade cannot restore deleted sessions; affected users simply sign in again.
+
+## 5. Start the backend
+
+Your existing `app/main.py` already registers `auth_router`. All new endpoints are on that router, so no additional router registration is needed.
+
+Retain the existing auth no-store/referrer headers and OAuth SessionMiddleware.
+
+```bash
+uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000 --no-access-log --no-proxy-headers
+```
+
+The last flag is appropriate for this direct local setup: client addresses come from the connection rather than untrusted forwarded headers. Behind a production reverse proxy, explicitly trust only that proxy and configure it to overwrite forwarded client addresses.
+
+Check:
+
+```bash
+curl -i http://localhost:8000/health
+```
+
+## 6. Test email verification
+
+Register a new local account:
+
+```bash
+curl -i http://localhost:8000/api/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -H 'X-Trace-Client: web' \
+  --data '{"name":"Verification Tester","email":"verify-demo@example.com","password":"Trace-local-demo-2026!"}'
+```
+
+Expected: 201 with `email_verified: false`.
+
+Try signing in before verification:
+
+```bash
+curl -i http://localhost:8000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -H 'X-Trace-Client: web' \
+  --data '{"email":"verify-demo@example.com","password":"Trace-local-demo-2026!"}'
+```
+
+Expected: 403, asking you to verify email.
+
+Open Mailpit at localhost:8025. Open “Verify your Trace email,” follow the complete link, and press the verification button. Visiting the link alone does not change account state.
+
+Expected: “Email verified. Sign in to continue.”
+
+Run the login command again: expect 200 and the normal HTTP-only session cookie.
+
+For an existing password account, or if you need a new verification email:
+
+```bash
+curl -i http://localhost:8000/api/v1/auth/email/verification-request \
+  -H 'Content-Type: application/json' \
+  -H 'X-Trace-Client: web' \
+  --data '{"email":"verify-demo@example.com"}'
+```
+
+Expected: 202 with the same message whether the account is eligible, already verified, absent, or suppressed by its email quota. This avoids using the resend endpoint to identify registered accounts.
+
+Links are purpose-bound and expire after 24 hours. Successful verification consumes all outstanding verification links for that user. A replay returns 400.
+
+## 7. Test password reset and session revocation
+
+First sign in and save a session cookie:
+
+```bash
+TRACE_COOKIE_JAR=$(mktemp)
+
+curl -i http://localhost:8000/api/v1/auth/login \
+  -c "$TRACE_COOKIE_JAR" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Trace-Client: web' \
+  --data '{"email":"verify-demo@example.com","password":"Trace-local-demo-2026!"}'
+```
+
+Request a reset:
+
+```bash
+curl -i http://localhost:8000/api/v1/auth/password/forgot \
+  -H 'Content-Type: application/json' \
+  -H 'X-Trace-Client: web' \
+  --data '{"email":"verify-demo@example.com"}'
+```
+
+Expected: 202. Open the reset email in Mailpit, follow its link, and enter a new password of 12–128 characters. The confirmation field must match.
+
+Expected: password changed; sign in with the new password. A separate notification email is sent, and all previous application sessions are revoked.
+
+Check the old cookie:
+
+```bash
+curl -i http://localhost:8000/api/v1/auth/me -b "$TRACE_COOKIE_JAR"
+```
+
+Expected: 401.
+
+The old password must now give 401; the new password must give 200. Reusing the reset link must give 400. Reset links expire after 30 minutes.
+
+Requesting a reset for an absent email or a Google/GitHub-only account returns the same 202 and sends no reset email. A password reset changes only an existing local password. It does not link accounts or create a password for provider-only users.
+
+Password reset does not separately flip email_verified. An old unverified local account must still complete verification before login.
+
+After testing:
+
+```bash
+rm "$TRACE_COOKIE_JAR"
+unset TRACE_COOKIE_JAR
+```
+
+## 8. Test login rate limiting
+
+The defaults are deliberately easy to inspect and change in `services/auth/rate_limit.py`:
+
+| Action | Limit | Window | Excess response |
+| --- | --- | --- | --- |
+| Login by email | 10 attempts | 15 minutes | 429 + Retry-After |
+| Login by client IP | 30 attempts | 15 minutes | 429 + Retry-After |
+| Registration by IP | 10 attempts | 1 hour | 429 + Retry-After |
+| Verification email requests by email | 3, including initial registration email | 1 hour | Generic 202 for resend; no additional email |
+| Reset email requests by email | 3 | 1 hour | Generic 202; no additional email |
+| Each email-request purpose by IP | 20 | 1 hour | 429 + Retry-After |
+| Verification token submissions by IP | 30 | 15 minutes | 429 + Retry-After |
+| Reset token submissions by IP | 10 | 15 minutes | 429 + Retry-After |
+
+Login counts all attempts, including successful ones. The email key is normalized to lowercase. Independent email and IP counters stop changing one dimension from bypassing the other. The shorter email window is a temporary throttle, not a persistent account-lock flag; password recovery has its own quota.
+
+Try 11 wrong-password attempts on a fresh email quota:
+
+```bash
+for attempt in {1..11}; do
+  curl -s -o /dev/null -w '%{http_code}\n' \
+    http://localhost:8000/api/v1/auth/login \
+    -H 'Content-Type: application/json' \
+    -H 'X-Trace-Client: web' \
+    --data '{"email":"rate-test@example.com","password":"wrong"}'
+done
+```
+
+Expected on fresh counters: ten 401 responses, then 429. An absent email is fine for this test. Earlier attempts count too. Restarting the backend does not clear counters.
+
+Inspect rate state without exposing email/IP keys:
+
+```bash
+docker compose -f ../infra/compose.yaml exec postgres \
+  psql -U trace -d trace \
+  -c "SELECT hits, window_end FROM auth_rate_limits ORDER BY window_end DESC LIMIT 10;"
+```
+
+The key is an HMAC of scope and subject, using the existing session signing secret. No raw email/IP is stored in this table. Rotating that secret resets effective rate-key identity.
+
+The implementation uses an atomic PostgreSQL INSERT ... ON CONFLICT DO UPDATE. Counter commits use separate transactions so failed login rollbacks do not undo rate limiting. Windows start with the first request and reset after expiration; repeated blocked requests do not push expiry forward.
+
+This limits Trace's own password login and recovery routes. Google/GitHub validate their own provider credentials; the existing OAuth routes are retained.
+
+## 9. Why the token flows work this way
+
+Verification:
+
+```text
+Register, store a token hash, and email the raw token.
+The confirmation form submits a POST to verify and consume the token.
+```
+
+Password reset:
+
+```text
+Accept the request with a generic 202 and check eligibility in the background.
+Email a reset link; its form submits the token and new password.
+One transaction changes the password, revokes sessions, and consumes reset tokens.
+```
+
+Links use a URL fragment (`#token=...`), which is not sent with the page's GET request. The page reads the fragment, removes it from the visible URL/history entry, and submits the token in a JSON POST. Raw tokens are never embedded into server-rendered HTML or API response bodies.
+
+The pages use no external resources, no-referrer/no-store headers, a nonce-based Content Security Policy, and textContent for result messages. Email scanners or link previews fetching the page do not redeem a token.
+
+The user-row lock serializes password login with password changes: an old-password login that finishes before reset has its new session revoked; a login that runs after reset checks the new hash. The same lock and token recheck prevent concurrent token redemption from succeeding twice.
+
+Existing Google/GitHub routes still enforce their provider email checks. Only those validated callbacks call the OAuth service with verified identity information.
+
+## 10. Automated checks
+
+Install development test tools if needed:
+
+```bash
+uv add --dev pytest httpx
+```
+
+Use a test database. From `backend`, while the local PostgreSQL service is running:
+
+```bash
+docker compose -f ../infra/compose.yaml exec postgres \
+  createdb -U trace trace_auth_test
+
+export TRACE_AUTH_TEST_DATABASE_URL='postgresql+psycopg://trace:trace@localhost:5432/trace_auth_test'
+
+uv run python -m pytest -q tests/test_auth_email_security.py
+```
+
+If `trace_auth_test` already exists, skip createdb. The URL above follows the earlier local trace/trace setup; if your local port or password differs, use your actual test connection. Each test creates/drops a uniquely named schema inside that database; it does not use the application's public tables. Do not point this at a production database.
+
+The suite covers verification gating, single use, expiry, purpose binding, generic recovery responses, provider-only recovery exclusion, session revocation, mail failures, email/IP throttles, cooldown expiry, protection headers, and OAuth compatibility. It includes three native PostgreSQL concurrency checks: duplicate redemption, simultaneous counter updates, and old-password login racing with reset.
+
+Preparation result: 12 tests passed against an embedded PostgreSQL engine (PGlite) with reconstructed versions of the earlier settings/DB/session helpers. The 3 native multi-connection concurrency checks were intentionally skipped. The user's actual migration, Mailpit SMTP round trip, Mac environment, and provider round trips after installation remain local checks.
+
+Do not set TRACE_AUTH_EMBEDDED_DB in your local run; that flag is reserved for the limited embedded-engine validation used while preparing this package.
+
+## 11. Cleanup and delivery behavior
+
+Expired records can be removed without resetting active limits:
+
+```bash
+uv run python -m scripts.cleanup_auth
+```
+
+This deletes expired email tokens, expired application sessions, and expired throttle windows only.
+
+Email work currently uses FastAPI BackgroundTasks. The HTTP response does not wait for SMTP eligibility/delivery work, and mail errors do not reveal account existence. This is best-effort local delivery: tasks are not a durable queue, and a process restart can lose queued delivery. Use resend if that happens. A failed SMTP send attempts to remove the associated token; tokens are never logged.
+
+For a later public release, add a durable delivery mechanism before promising email delivery/retries. Continue to use the existing HTTPS/secure-cookie and exact-origin settings. No external service or deployment is created by this package.
+
+## 12. Code map
+
+| File | Responsibility |
+| --- | --- |
+| models/auth.py | Existing auth tables plus verified flag, hashed action tokens, PostgreSQL rate buckets. |
+| schemas/auth.py | Existing payloads plus email/token/reset payloads and verified flag in user response. |
+| services/auth/rate_limit.py | Atomic independent counters, IP and email policy. |
+| services/auth/email_actions.py | Issue, email, consume, expiry, reset/session transaction, notification. |
+| services/auth/mailer.py | SMTP transport with optional STARTTLS or implicit TLS. |
+| services/auth/pages.py | Local verification/reset forms with explicit POST. |
+| api/v1/routes/auth.py | Existing auth endpoints plus verification/recovery endpoints and limits. |
+| services/auth/oauth.py | Preserve verified provider onboarding and existing email-collision policy. |
+| core/email_config.py | Additional SMTP settings without replacing existing application settings. |
+
+Next after these local checks pass: record the outcomes in the tracking files, then continue with the authenticated React frontend.
