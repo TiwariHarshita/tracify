@@ -29,7 +29,8 @@ def main():
     test_env.update(DATABASE_URL=test_url, TRACE_AUTH_TEST_DATABASE_URL=test_url)
     result = subprocess.run([sys.executable, "-m", "pytest", "-q",
         "tests/test_phase3.py", "tests/test_csv_api.py", "tests/test_csv_parser.py",
-        "tests/test_analytics.py", "tests/test_analytics_api.py", "tests/test_report_editor.py"], env=test_env)
+        "tests/test_analytics.py", "tests/test_analytics_api.py", "tests/test_report_editor.py",
+        "tests/test_sharing.py"], env=test_env)
     raise SystemExit(result.returncode)
 
 

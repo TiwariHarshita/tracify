@@ -166,6 +166,23 @@ def test_public_tips_known_totals():
     assert result[2]["result"]["rows"][0]["value"]==244
 
 
+def test_metric_projects_only_its_value_and_filter_columns():
+    data = ("amount,group,unused_a,unused_b\n" + "\n".join(
+        f"{index % 10},A,unneeded-{index},also-unneeded-{index}" for index in range(1_000)
+    )).encode()
+    profile, rows, _ = parse_csv(data)
+    request = EvaluateRequest(expected_sha256=profile["sha256"],
+        calculations=[metric()], filters=[dict(type="category", column="c1", values=["A"])])
+    engine = Engine(profile, rows, request)
+    try:
+        item = engine.run()["results"][0]
+        assert engine.sql_types.keys() == {"c0", "c1"}
+        assert item["result"]["rows"][0]["value"] == "4500"
+        assert item["receipt"]["column_mapping"][2]["sql_type"] == "not materialized for this calculation"
+    finally:
+        engine.close()
+
+
 def test_decimal_values_beyond_javascript_precision_remain_exact():
     item=run(data=b"amount\n9007199254740993.01\n0.09\n")["results"][0]
     assert item["result"]["rows"][0]["value"]=="9007199254740993.10"

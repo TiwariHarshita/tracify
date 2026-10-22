@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
@@ -49,3 +50,8 @@ class ReportVersion(StrictModel):
 
 class SaveReport(ReportVersion, ReportTitle):
     definition: ReportDefinition
+
+
+class CreateShareLink(ReportVersion):
+    # Null means no expiry; a concrete date must be future-dated by the service.
+    expires_at: datetime | None = None

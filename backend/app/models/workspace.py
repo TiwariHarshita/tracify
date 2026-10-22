@@ -35,3 +35,29 @@ class Report(Base):
         default=lambda: {"version": 1, "blocks": [], "filters": []}, server_default=text("'{}'::jsonb"))
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
     __mapper_args__ = {"version_id_col": revision}
+
+
+class ReportSnapshot(Base):
+    """Immutable, server-produced report output. It deliberately has no file path."""
+    __tablename__ = "report_snapshots"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    report_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("reports.id", ondelete="CASCADE"), index=True)
+    owner_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    report_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ReportShareLink(Base):
+    __tablename__ = "report_share_links"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    report_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("reports.id", ondelete="CASCADE"), index=True)
+    owner_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    snapshot_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("report_snapshots.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

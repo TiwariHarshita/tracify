@@ -13,6 +13,7 @@ from app.api.v1.routes.analytics import router as analytics_router
 # After app = FastAPI(...)
 # Alongside your imports:
 from app.api.v1.routes.report_editor import router as report_editor_router
+from app.api.v1.routes.sharing import private as sharing_router, public as public_sharing_router
 
 # Alongside your existing router registrations, once:
 
@@ -42,6 +43,8 @@ app.include_router(auth_router, prefix="/api/v1")
 app.include_router(oauth_router, prefix="/api/v1")
 app.include_router(workspace_router, prefix="/api/v1")
 app.include_router(report_editor_router, prefix="/api/v1")
+app.include_router(sharing_router, prefix="/api/v1")
+app.include_router(public_sharing_router, prefix="/api/v1")
 app.include_router(csv_router, prefix="/api/v1")
 app.include_router(analytics_router, prefix="/api/v1")
 

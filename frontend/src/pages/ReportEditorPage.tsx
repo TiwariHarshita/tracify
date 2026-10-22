@@ -7,6 +7,8 @@ import { reportEditorApi } from '../lib/reportEditor';
 import type { Definition, EditorReport, ReportBlock, ReportEvaluation } from '../lib/reportEditor';
 import { BlockFields, GlobalFilters, newBlock } from '../components/ReportControls';
 import { ReportResults } from '../components/ReportResults';
+import { sharingApi } from '../lib/sharing';
+import type { ShareLink } from '../lib/sharing';
 import { Feedback } from '../components/Feedback';
 import '../workspace.css';
 import '../csv.css';
@@ -27,6 +29,8 @@ export function ReportEditorPage() {
   const [conflict,setConflict]=useState(false);
   const [status,setStatus]=useState('');
   const [output,setOutput]=useState<ReportEvaluation|null>(null);
+  const [shareUrl,setShareUrl]=useState('');
+  const [shareLinks,setShareLinks]=useState<ShareLink[]>([]);
   function failure(cause:unknown) {
     setError(readableError(cause));
     if(cause instanceof ApiError&&cause.status===409)setConflict(true);
@@ -37,7 +41,7 @@ export function ReportEditorPage() {
   }
   useEffect(()=>{
     let active=true;++epoch.current;setBusy(false);setLoading(true);setError('');setReport(null);setOutput(null);setDirty(false);setStatus('');
-    reportEditorApi.load(reportId).then(value=>{if(active)accept(value);}).catch(cause=>{if(active)failure(cause);}).finally(()=>{if(active)setLoading(false);});
+    Promise.all([reportEditorApi.load(reportId),sharingApi.list(reportId)]).then(([value,links])=>{if(active){accept(value);setShareLinks(links);}}).catch(cause=>{if(active)failure(cause);}).finally(()=>{if(active)setLoading(false);});
     return()=>{active=false;++epoch.current;};
   },[reportId]);
   useEffect(()=>{
@@ -68,6 +72,14 @@ export function ReportEditorPage() {
     }catch(cause){if(ticket===epoch.current)failure(cause);}finally{if(ticket===epoch.current)setBusy(false);}
   }
   function submit(event:FormEvent<HTMLFormElement>) {event.preventDefault();const action=(event.nativeEvent as SubmitEvent).submitter?.getAttribute('value');void persist(action==='calculate');}
+  async function share(){
+    if(!report||dirty)return;
+    const expiry=window.prompt('Expiry (days, blank for no expiry)', '7'); if(expiry===null)return;
+    const days=expiry.trim()===''?null:Number(expiry);
+    if(days!==null&&(!Number.isInteger(days)||days<1||days>365)){setError('Enter a whole number from 1 to 365, or leave expiry blank.');return;}
+    setBusy(true);setError('');try{const expiresAt=days===null?null:new Date(Date.now()+days*86400000).toISOString();const link=await sharingApi.create(report.id,report.revision,report.dataset.sha256,expiresAt);const url=window.location.origin+'/share/'+link.url_token;setShareUrl(url);let copied=false;try{if(navigator.clipboard){await navigator.clipboard.writeText(url);copied=true;}}catch{/* Clipboard permission must not turn a successful share into an error. */}setShareLinks(await sharingApi.list(report.id));setStatus('Frozen share link created'+(copied?' and copied.':' — copy the link shown below.'));}catch(cause){failure(cause);}finally{setBusy(false);}
+  }
+  async function revoke(linkId:string){if(!report||!window.confirm('Revoke this share link immediately?'))return;setBusy(true);setError('');try{await sharingApi.revoke(report.id,linkId);setShareLinks(await sharingApi.list(report.id));setStatus('Share link revoked.');}catch(cause){failure(cause);}finally{setBusy(false);}}
   return <section className="workspace-page report-editor">
     <Link className="report-back" to="/app" onClick={event=>{if(dirty&&!window.confirm('Leave without saving your report changes?'))event.preventDefault();}}>← Workspace</Link>
     <span className="eyebrow">Report builder</span><h1>{report?.title||'Your report'}</h1>
@@ -80,9 +92,11 @@ export function ReportEditorPage() {
       {!report.profile.analysis_ready&&<Feedback>This dataset has unreadable records and cannot be calculated.</Feedback>}
       <form onSubmit={submit}><fieldset className="report-form" disabled={busy}>
         <section className="workspace-card report-toolbar"><div className="field"><label htmlFor="editor-title">Report title</label><input id="editor-title" required maxLength={120} value={title} onChange={event=>{setTitle(event.target.value);setDirty(true);setOutput(null);setStatus('');}}/></div>
-          <div className="report-actions"><button className="button secondary" type="submit" value="save" disabled={busy||conflict||!dirty}>Save report</button><button className="button primary" type="submit" value="calculate" disabled={busy||conflict||!report.profile.analysis_ready}>{busy?'Working…':'Save and calculate'}</button></div>
+          <div className="report-actions"><button className="button secondary" type="submit" value="save" disabled={busy||conflict||!dirty}>Save report</button><button className="button primary" type="submit" value="calculate" disabled={busy||conflict||!report.profile.analysis_ready}>{busy?'Working…':'Save and calculate'}</button><button className="button secondary" type="button" onClick={()=>void share()} disabled={busy||conflict||dirty||!report.profile.analysis_ready}>Freeze & share</button></div>
         </section>
         {status&&<p className="report-status" role="status">{status}</p>}
+        {shareUrl&&<p className="report-status">Share link: <a href={shareUrl} target="_blank" rel="noreferrer">{shareUrl}</a></p>}
+        {!!shareLinks.length&&<section className="report-section"><h2>Shared snapshots</h2>{shareLinks.map(link=><div className="workspace-row" key={link.id}><small>Created {new Date(link.created_at).toLocaleString()} · {link.expires_at?'Expires '+new Date(link.expires_at).toLocaleString():'No expiry'}{link.revoked_at&&' · Revoked'}</small><button type="button" className="text-button" disabled={busy||!!link.revoked_at} onClick={()=>void revoke(link.id)}>Revoke</button></div>)}</section>}
         <GlobalFilters filters={definition.filters} profile={report.profile} onChange={filters=>edit({...definition,filters})}/>
         <div className="report-add"><h2>Blocks</h2><div className="report-actions">{(['metric','chart','table','note'] as const).map(type=><button type="button" className="button secondary" key={type} disabled={definition.blocks.length>=20} onClick={()=>edit({...definition,blocks:[...definition.blocks,newBlock(type,report.profile)]})}>Add {type}</button>)}</div><p className="report-hint">Up to 20 blocks. Save and calculate after changing blocks or filters.</p></div>
         {!definition.blocks.length&&<section className="workspace-card"><p className="workspace-empty">Add a metric, chart, table or note to start your report.</p></section>}

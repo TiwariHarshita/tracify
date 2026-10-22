@@ -8,6 +8,7 @@ import { RecoveryPage } from './pages/RecoveryPage';
 import { WorkspacePage } from './pages/WorkspacePage';
 import { ReportEditorPage } from './pages/ReportEditorPage';
 import { AccountPage } from './pages/AccountPage';
+import { PublicReportPage } from './pages/PublicReportPage';
 
 export default function App() {
   return <Routes>
@@ -22,6 +23,7 @@ export default function App() {
       <Route path="/app/reports/:reportId" element={<ReportEditorPage />} />
       <Route path="/app/account" element={<AccountPage />} />
     </Route></Route>
+    <Route path="/share/:token" element={<PublicReportPage />} />
     <Route path="*" element={<Navigate to="/app" replace />} />
   </Routes>;
 }

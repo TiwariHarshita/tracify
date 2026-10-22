@@ -57,6 +57,20 @@ class Engine:
     def __init__(self, profile, rows, request):
         self.profile, self.rows, self.request = profile, rows, request
         self.columns = {column["key"]: column for column in profile["columns"]}
+        self.column_indexes = {column["key"]: index for index, column in enumerate(profile["columns"])}
+        # Only materialize typed fields that this batch can query. Parsed rows
+        # remain the source of truth for table cells, so a metric does not pay
+        # to duplicate every raw value from a wide CSV inside DuckDB.
+        requested = {item.column for item in request.filters}
+        for block in request.calculations:
+            if block.type == "table":
+                requested.add(block.sort_by)
+            else:
+                if block.column is not None:
+                    requested.add(block.column)
+                if block.group_by is not None:
+                    requested.add(block.group_by)
+        self.typed_keys = {key for key in requested if key in self.columns}
         self.sql_types = {}
         self.scales = {}
         self.deadline = time.monotonic() + QUERY_SECONDS
@@ -99,6 +113,8 @@ class Engine:
         definitions = ["record_number BIGINT", "line_start BIGINT", "line_end BIGINT"]
         for index, column in enumerate(self.profile["columns"]):
             key = column["key"]
+            if key not in self.typed_keys:
+                continue
             if column["type"] == "number":
                 scales, integers = [0], [0]
                 for row in self.rows:
@@ -114,13 +130,13 @@ class Engine:
             else:
                 kind = "TIMESTAMP" if column["type"] == "date" else "VARCHAR"
             self.sql_types[key] = kind
-            definitions.extend([f'"{key}" {kind}', f'"raw_{key}" VARCHAR'])
+            definitions.append(f'"{key}" {kind}')
         for row in self.rows:
             self.check_time()
             item = {key: row[key] for key in ["record_number", "line_start", "line_end"]}
-            for index, column in enumerate(self.profile["columns"]):
-                key, value = column["key"], row["cells"][index]
-                item["raw_" + key] = value
+            for key in self.typed_keys:
+                index, column = self.column_indexes[key], self.columns[key]
+                value = row["cells"][index]
                 if not value.strip():
                     item[key] = None
                 elif column["type"] == "number":
@@ -137,7 +153,7 @@ class Engine:
         # JSON is a bound, in-memory string; external access stays disabled.
         keys = [(key, "BIGINT") for key in ["record_number", "line_start", "line_end"]]
         for key, kind in self.sql_types.items():
-            keys.extend([(key, kind), ("raw_" + key, "VARCHAR")])
+            keys.append((key, kind))
         select = ", ".join(f"CAST(value ->> '{key}' AS {kind})" for key, kind in keys)
         self.execute("INSERT INTO source SELECT " + select + " FROM json_each(?)", [json.dumps(payload, ensure_ascii=False)])
 
@@ -191,9 +207,16 @@ class Engine:
         total, matched = counts["total_rows"], counts["matched_rows"]
         if block.type == "table":
             sort = self.column(block.sort_by)
-            selected = ["record_number", "line_start", "line_end"] + [f'"raw_{key}" AS "{key}"' for key in self.columns]
+            selected = ["record_number", "line_start", "line_end"]
             sql = "SELECT " + ", ".join(selected) + f' FROM source WHERE {where} ORDER BY source."{block.sort_by}" {block.direction.upper()} NULLS LAST, record_number ASC LIMIT ?'
             data, result_query = self.query(sql, parameters + [block.limit])
+            # The query chooses rows by typed values. Cells are then restored
+            # directly from the already-parsed source rows, avoiding a full
+            # raw-string duplicate in DuckDB for every table calculation.
+            source_rows = {row["record_number"]: row for row in self.rows}
+            for item in data:
+                source = source_rows[item["record_number"]]
+                item.update({key: source["cells"][index] for key, index in self.column_indexes.items()})
             included, missing = len(data), 0
             limited = matched - included
             explanation = f'Show up to {block.limit} rows ordered by {sort["name"]}, {block.direction}ending; missing sort values last, ties by original record number. Return original cell strings.'
@@ -246,8 +269,8 @@ class Engine:
             "filter_logic": "AND", "calculation_version": CALCULATION_VERSION,
             "parser_version": self.profile["parser_version"], "dataset_sha256": self.profile["sha256"],
             "delimiter": self.profile["delimiter"],
-            "column_mapping": [{"key": key, "name": value["name"], "inferred_type": value["type"], "sql_type": self.sql_types[key]} for key, value in self.columns.items()],
-            "source_relation": "source is rebuilt from every readable record of the verified original CSV using its stored delimiter and trace-csv-v1; empty/whitespace values become SQL NULL. Raw strings and record/source-line numbers are retained. Dates and naive timestamps are UTC; offset timestamps are converted to UTC.",
+            "column_mapping": [{"key": key, "name": value["name"], "inferred_type": value["type"], "sql_type": self.sql_types.get(key, "not materialized for this calculation")} for key, value in self.columns.items()],
+            "source_relation": "source is rebuilt from every readable record of the verified original CSV using its stored delimiter and trace-csv-v1, projecting only typed columns required by this calculation; empty/whitespace values become SQL NULL. Record/source-line numbers are retained. Table cells are restored as original CSV strings for the selected record numbers. Dates and naive timestamps are UTC; offset timestamps are converted to UTC.",
         }
         return {"id": block.id, "type": block.type, "result": result, "receipt": receipt}
 

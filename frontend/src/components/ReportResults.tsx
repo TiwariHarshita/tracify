@@ -12,7 +12,7 @@ function ResultTable({rows,labels={}}:{rows:Row[];labels?:Record<string,string>}
   return <div className="csv-scroll"><table><thead><tr>{keys.map(key=><th key={key}>{labels[key]||key.replaceAll('_',' ')}</th>)}</tr></thead><tbody>{rows.map((row,index)=><tr key={index}>{keys.map(key=><td key={key}>{display(row[key])}</td>)}</tr>)}</tbody></table></div>;
 }
 
-function Plot({block,result,profile}:{block:Extract<ReportBlock,{type:'chart'}>;result:CalculationResult;profile:CsvProfile}) {
+function Plot({block,result,profile}:{block:Extract<ReportBlock,{type:'chart'}>;result:CalculationResult;profile:Pick<CsvProfile,'columns'>}) {
   const rows=result.result.rows;
   const groupType=profile.columns.find(column=>column.key===block.group_by)?.type;
   const points=rows.map(row=>({label:display(row.group_value),raw:display(row.value),
@@ -44,7 +44,7 @@ function Plot({block,result,profile}:{block:Extract<ReportBlock,{type:'chart'}>;
   </svg></div>;
 }
 
-export function ReportResults({block,item,profile}:{block:ReportBlock;item:CalculationResult;profile:CsvProfile}) {
+export function ReportResults({block,item,profile}:{block:ReportBlock;item:CalculationResult;profile:Pick<CsvProfile,'columns'>}) {
   const rows=item.result.rows;
   return <div className="report-result">
     {block.type==='metric'&&!block.group_by?<div className="report-metric"><span>{block.operation}{block.column&&' of '+profile.columns.find(column=>column.key===block.column)?.name}</span><strong>{display(rows[0]?.value)}</strong></div>:
